@@ -1,4 +1,4 @@
-module github.com/linear/rabbitmq
+module github.com/Deivisson/go-rabbitmq
 
 go 1.16
 
