@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -8,20 +9,43 @@ import (
 	"github.com/streadway/amqp"
 )
 
+type Exchange struct {
+	Name    string
+	Type    string
+	Declare bool
+}
+
+type Queue struct {
+	Name          string
+	Durable       bool
+	AutoDelete    bool
+	Exclusive     bool
+	NoWait        bool
+	Args          amqp.Table
+	RoutingKey    string
+	BindExchanges *[]string
+}
+
+type RetryConfig struct {
+	RetryQueue    *Queue
+	RetryExchange *Exchange
+	RetryTimeout  int
+	ErrorQueue    *Queue
+	ErrorExchange *Exchange
+}
+
 type ConsumerConfig struct {
-	ExchangeName    string
-	ExchangeType    string
-	DeclareExchange bool
-	RoutingKey      string
-	QueueName       string
-	ConsumerName    string
-	ConsumerCount   int
-	PrefetchCount   int
-	Reconnect       struct {
+	Exchange      *Exchange
+	Queue         *Queue
+	Retryable     bool
+	RetryConfig   *RetryConfig
+	ConsumerName  string
+	ConsumerCount int
+	PrefetchCount int
+	Reconnect     struct {
 		MaxAttempt int
 		Interval   time.Duration
 	}
-	BindExchanges *[]string
 }
 
 type Consumer struct {
@@ -52,15 +76,11 @@ func (c *Consumer) Start(worker Worker) error {
 		return err
 	}
 
-	if err = c.declareExchange(channel); err != nil {
+	if err = c.declareRetryQueues(channel); err != nil {
 		return err
 	}
 
-	if err = c.declareQueue(channel); err != nil {
-		return err
-	}
-
-	if err = c.bindQueue(channel); err != nil {
+	if err = c.declareDefaults(channel); err != nil {
 		return err
 	}
 
@@ -76,6 +96,159 @@ func (c *Consumer) Start(worker Worker) error {
 	// Simulate manual connection close
 	//_ = con.Close()
 
+	return nil
+}
+
+func (c *Consumer) declareDefaults(chn *amqp.Channel) error {
+	if err := declareExchange(chn, c.Config.Exchange); err != nil {
+		return err
+	}
+
+	if c.Config.Retryable && c.Config.Queue.Args == nil {
+		c.Config.Queue.Args = map[string]interface{}{
+			"x-dead-letter-exchange": fmt.Sprintf("%s-retry", c.Config.Queue.Name),
+		}
+	}
+
+	if err := declareQueue(chn, c.Config.Queue); err != nil {
+		return err
+	}
+
+	if err := bindQueue(chn, c.Config.Queue, c.Config.Exchange); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Consumer) declareRetryQueues(chn *amqp.Channel) error {
+	if !c.Config.Retryable {
+		return nil
+	}
+
+	rc := c.Config.RetryConfig
+	if rc == nil {
+		rc = &RetryConfig{}
+	}
+
+	prepareRetryParams(rc, c.Config.Queue.Name)
+
+	if err := declareExchange(chn, rc.RetryExchange); err != nil {
+		return err
+	}
+
+	if err := declareQueue(chn, rc.RetryQueue); err != nil {
+		return err
+	}
+
+	if err := bindQueue(chn, rc.RetryQueue, rc.RetryExchange); err != nil {
+		return err
+	}
+
+	if err := declareExchange(chn, rc.ErrorExchange); err != nil {
+		return err
+	}
+
+	if err := declareQueue(chn, rc.ErrorQueue); err != nil {
+		return err
+	}
+
+	if err := bindQueue(chn, rc.ErrorQueue, rc.ErrorExchange); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func prepareRetryParams(rf *RetryConfig, defaultQueueName string) {
+	if rf.RetryQueue == nil {
+		rf.RetryQueue = &Queue{
+			Name:    fmt.Sprintf("%s-retry", defaultQueueName),
+			Durable: true,
+			Args: map[string]interface{}{
+				"x-dead-letter-exchange": defaultQueueName,
+				"x-message-ttl":          60 * 1000,
+			},
+		}
+	}
+
+	if rf.ErrorQueue == nil {
+		rf.ErrorQueue = &Queue{
+			Name:    fmt.Sprintf("%s-error", defaultQueueName),
+			Durable: true,
+		}
+	}
+
+	if rf.RetryExchange == nil {
+		rf.RetryExchange = &Exchange{
+			Name:    rf.RetryQueue.Name,
+			Type:    amqp.ExchangeDirect,
+			Declare: true,
+		}
+	}
+
+	if rf.ErrorExchange == nil {
+		rf.ErrorExchange = &Exchange{
+			Name:    rf.ErrorQueue.Name,
+			Type:    amqp.ExchangeDirect,
+			Declare: true,
+		}
+	}
+}
+
+func declareExchange(chn *amqp.Channel, ex *Exchange) error {
+	if ex == nil || !ex.Declare {
+		return nil
+	}
+	return chn.ExchangeDeclare(
+		ex.Name,
+		ex.Type,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+}
+
+func declareQueue(chn *amqp.Channel, que *Queue) error {
+	_, err := chn.QueueDeclare(
+		que.Name,
+		que.Durable,
+		que.AutoDelete,
+		que.Exclusive,
+		que.NoWait,
+		que.Args,
+	)
+	return err
+}
+
+func bindQueue(chn *amqp.Channel, que *Queue, ex *Exchange) error {
+	if ex != nil {
+		if err := chn.QueueBind(
+			que.Name,
+			que.RoutingKey,
+			ex.Name,
+			false,
+			nil,
+		); err != nil {
+			return err
+		}
+	}
+
+	if que.BindExchanges != nil {
+		for _, v := range *que.BindExchanges {
+			if err := chn.QueueBind(
+				que.Name,
+				que.RoutingKey,
+				v,
+				false,
+				nil,
+			); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -117,58 +290,4 @@ func (c *Consumer) closedConnectionListener(closed <-chan *amqp.Error, worker Wo
 		log.Println("INFO: Connection closed normally, will not reconnect")
 		os.Exit(0)
 	}
-}
-
-func (c *Consumer) declareExchange(chn *amqp.Channel) error {
-	config := c.Config
-	if !config.DeclareExchange {
-		return nil
-	}
-	return chn.ExchangeDeclare(
-		c.Config.ExchangeName,
-		c.Config.ExchangeType,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-}
-
-func (c *Consumer) declareQueue(chn *amqp.Channel) error {
-	_, err := chn.QueueDeclare(
-		c.Config.QueueName,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	return err
-}
-
-func (c *Consumer) bindQueue(chn *amqp.Channel) error {
-	var config = c.Config
-	if config.ExchangeName != "" {
-		return chn.QueueBind(
-			config.QueueName,
-			config.RoutingKey,
-			config.ExchangeName,
-			false,
-			nil,
-		)
-	}
-
-	for _, v := range *config.BindExchanges {
-		if err := chn.QueueBind(
-			config.QueueName,
-			config.RoutingKey,
-			v,
-			false,
-			nil,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
 }
