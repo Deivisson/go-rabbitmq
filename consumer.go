@@ -23,15 +23,21 @@ type Queue struct {
 	NoWait        bool
 	Args          amqp.Table
 	RoutingKey    string
-	BindExchanges *[]string
+	BindExchanges *[]Exchange
 }
 
 type RetryConfig struct {
 	RetryQueue    *Queue
 	RetryExchange *Exchange
-	RetryTimeout  int
+	RetryTimeout  time.Duration
+	RetryCount    int64
 	ErrorQueue    *Queue
 	ErrorExchange *Exchange
+}
+
+type Reconnect struct {
+	MaxAttempt int
+	Interval   time.Duration
 }
 
 type ConsumerConfig struct {
@@ -42,10 +48,7 @@ type ConsumerConfig struct {
 	ConsumerName  string
 	ConsumerCount int
 	PrefetchCount int
-	Reconnect     struct {
-		MaxAttempt int
-		Interval   time.Duration
-	}
+	Reconnect     Reconnect
 }
 
 type Consumer struct {
@@ -126,12 +129,11 @@ func (c *Consumer) declareRetryQueues(chn *amqp.Channel) error {
 		return nil
 	}
 
-	rc := c.Config.RetryConfig
-	if rc == nil {
-		rc = &RetryConfig{}
+	if c.Config.RetryConfig == nil {
+		c.Config.RetryConfig = &RetryConfig{}
+		prepareRetryParams(c.Config.RetryConfig, c.Config)
 	}
-
-	prepareRetryParams(rc, c.Config.Queue.Name)
+	rc := c.Config.RetryConfig
 
 	if err := declareExchange(chn, rc.RetryExchange); err != nil {
 		return err
@@ -160,29 +162,43 @@ func (c *Consumer) declareRetryQueues(chn *amqp.Channel) error {
 	return nil
 }
 
-func prepareRetryParams(rf *RetryConfig, defaultQueueName string) {
+func prepareRetryParams(rf *RetryConfig, cc ConsumerConfig) {
+	defaultQueueName := cc.Queue.Name
+	exchange := cc.Exchange
+	dle := defaultQueueName
+	if exchange != nil {
+		dle = exchange.Name
+	}
+
 	if rf.RetryQueue == nil {
+		timeout := rf.RetryTimeout
+		if timeout == 0 {
+			timeout = 60 * 1000 // Default 60 seconds
+		}
 		rf.RetryQueue = &Queue{
-			Name:    fmt.Sprintf("%s-retry", defaultQueueName),
-			Durable: true,
+			Name:       fmt.Sprintf("%s-retry", defaultQueueName),
+			Durable:    true,
+			RoutingKey: "#",
 			Args: map[string]interface{}{
-				"x-dead-letter-exchange": defaultQueueName,
-				"x-message-ttl":          60 * 1000,
+				"x-dead-letter-exchange":    dle,
+				"x-message-ttl":             timeout,
+				"x-dead-letter-routing-key": defaultQueueName,
 			},
 		}
 	}
 
 	if rf.ErrorQueue == nil {
 		rf.ErrorQueue = &Queue{
-			Name:    fmt.Sprintf("%s-error", defaultQueueName),
-			Durable: true,
+			Name:       fmt.Sprintf("%s-error", defaultQueueName),
+			Durable:    true,
+			RoutingKey: "#",
 		}
 	}
 
 	if rf.RetryExchange == nil {
 		rf.RetryExchange = &Exchange{
 			Name:    rf.RetryQueue.Name,
-			Type:    amqp.ExchangeDirect,
+			Type:    amqp.ExchangeTopic,
 			Declare: true,
 		}
 	}
@@ -190,9 +206,13 @@ func prepareRetryParams(rf *RetryConfig, defaultQueueName string) {
 	if rf.ErrorExchange == nil {
 		rf.ErrorExchange = &Exchange{
 			Name:    rf.ErrorQueue.Name,
-			Type:    amqp.ExchangeDirect,
+			Type:    amqp.ExchangeTopic,
 			Declare: true,
 		}
+	}
+
+	if rf.RetryCount == 0 {
+		rf.RetryCount = 5
 	}
 }
 
@@ -238,10 +258,14 @@ func bindQueue(chn *amqp.Channel, que *Queue, ex *Exchange) error {
 
 	if que.BindExchanges != nil {
 		for _, v := range *que.BindExchanges {
+			routingKey := que.RoutingKey
+			if v.Type == amqp.ExchangeFanout {
+				routingKey = ""
+			}
 			if err := chn.QueueBind(
 				que.Name,
-				que.RoutingKey,
-				v,
+				routingKey,
+				v.Name,
 				false,
 				nil,
 			); err != nil {
@@ -290,4 +314,42 @@ func (c *Consumer) closedConnectionListener(closed <-chan *amqp.Error, worker Wo
 		log.Println("INFO: Connection closed normally, will not reconnect")
 		os.Exit(0)
 	}
+}
+
+func (c *Consumer) Reject(channel *amqp.Channel, msg *amqp.Delivery, requeue bool) error {
+	if !c.Config.Retryable {
+		return msg.Reject(requeue)
+	}
+
+	count, _ := getRetryCount(msg, c.Config.Queue.Name)
+	if count >= c.Config.RetryConfig.RetryCount {
+		if err := channel.Publish(
+			c.Config.RetryConfig.ErrorExchange.Name,
+			"",
+			false,
+			false,
+			amqp.Publishing{
+				Body: msg.Body,
+			},
+		); err != nil {
+			return err
+		}
+		return msg.Ack(false)
+	} else {
+		return msg.Reject(requeue)
+	}
+}
+
+func getRetryCount(msg *amqp.Delivery, queueName string) (int64, error) {
+	if v, ok := msg.Headers["x-death"]; ok {
+		if v2, ok := v.([]interface{}); ok {
+			for _, s := range v2 {
+				x := s.(amqp.Table)
+				if queueName == x["queue"] {
+					return x["count"].(int64), nil
+				}
+			}
+		}
+	}
+	return 0, nil
 }

@@ -22,6 +22,7 @@ type Rabbit struct {
 	connection *amqp.Connection
 }
 
+// NewRabbit returns a instance of Rabbit
 func NewRabbit(config RabbitConfig) *Rabbit {
 	return &Rabbit{
 		config: config,
