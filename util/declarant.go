@@ -106,6 +106,7 @@ func (d *Declarant) prepareRetryParams(rf *types.RetryConfig) {
 		}
 		rf.RetryQueue = &types.Queue{
 			Name:       fmt.Sprintf("%s-%s", defaultQueueName, DEFAULT_RETRY_QUEUE_SUFFIX),
+			Declare:    true,
 			Durable:    true,
 			RoutingKey: "#",
 			Args: map[string]interface{}{
@@ -119,6 +120,7 @@ func (d *Declarant) prepareRetryParams(rf *types.RetryConfig) {
 	if rf.ErrorQueue == nil {
 		rf.ErrorQueue = &types.Queue{
 			Name:       fmt.Sprintf("%s-%s", defaultQueueName, DEFAULT_ERROR_QUEUE_SUFFIX),
+			Declare:    true,
 			Durable:    true,
 			RoutingKey: "#",
 		}
