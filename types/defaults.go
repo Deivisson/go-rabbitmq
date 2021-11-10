@@ -32,8 +32,8 @@ type Queue struct {
 type RetryConfig struct {
 	RetryQueue    *Queue
 	RetryExchange *Exchange
-	RetryTimeout  time.Duration
-	RetryCount    int64
+	RetryTimeout  int64
+	RetryCount    int
 	ErrorQueue    *Queue
 	ErrorExchange *Exchange
 }

@@ -132,13 +132,13 @@ func (c *Consumer) closedConnectionListener(closed <-chan *amqp.Error, worker Wo
 }
 
 // getRetryCount get the number of times a message was on processing queue
-func getRetryCount(msg *amqp.Delivery, queueName string) (int64, error) {
+func getRetryCount(msg *amqp.Delivery, queueName string) (int, error) {
 	if v, ok := msg.Headers["x-death"]; ok {
 		if v2, ok := v.([]interface{}); ok {
 			for _, s := range v2 {
 				x := s.(amqp.Table)
 				if queueName == x["queue"] {
-					return x["count"].(int64), nil
+					return x["count"].(int), nil
 				}
 			}
 		}
