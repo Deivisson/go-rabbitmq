@@ -1,30 +1,21 @@
 package rabbitmq
 
 import (
-	"fmt"
+	"log"
+	"os"
 	"time"
 
+	"github.com/Deivisson/go-rabbitmq/types"
+	util "github.com/Deivisson/go-rabbitmq/util"
 	"github.com/streadway/amqp"
 )
 
-type RetryConfig struct {
-	RetryQueue    *Queue
-	RetryExchange *Exchange
-	RetryTimeout  time.Duration
-	RetryCount    int64
-	ErrorQueue    *Queue
-	ErrorExchange *Exchange
-}
-
 type ConsumerConfig struct {
-	Exchange      *Exchange
-	Queue         *Queue
-	Retryable     bool
-	RetryConfig   *RetryConfig
+	types.BaseConfig
 	ConsumerName  string
 	ConsumerCount int
 	PrefetchCount int
-	Reconnect     Reconnect
+	Reconnect     types.Reconnect
 }
 
 type Consumer struct {
@@ -55,11 +46,8 @@ func (c *Consumer) Start(worker Worker) error {
 		return err
 	}
 
-	if err = c.declareRetryQueues(channel); err != nil {
-		return err
-	}
-
-	if err = c.declareDefaults(channel); err != nil {
+	d := util.Declarant{Config: &c.Config.BaseConfig, Channel: channel}
+	if err := d.PrepareQueuesExchange(); err != nil {
 		return err
 	}
 
@@ -78,127 +66,16 @@ func (c *Consumer) Start(worker Worker) error {
 	return nil
 }
 
-func (c *Consumer) declareDefaults(chn *amqp.Channel) error {
-	if err := declareExchange(chn, c.Config.Exchange); err != nil {
-		return err
-	}
-
-	if c.Config.Retryable && c.Config.Queue.Args == nil {
-		c.Config.Queue.Args = map[string]interface{}{
-			"x-dead-letter-exchange": fmt.Sprintf("%s-retry", c.Config.Queue.Name),
-		}
-	}
-
-	if err := declareQueue(chn, c.Config.Queue); err != nil {
-		return err
-	}
-
-	if err := bindQueue(chn, c.Config.Queue, c.Config.Exchange); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (c *Consumer) declareRetryQueues(chn *amqp.Channel) error {
-	if !c.Config.Retryable {
-		return nil
-	}
-
-	if c.Config.RetryConfig == nil {
-		c.Config.RetryConfig = &RetryConfig{}
-		prepareRetryParams(c.Config.RetryConfig, c.Config)
-	}
-	rc := c.Config.RetryConfig
-
-	if err := declareExchange(chn, rc.RetryExchange); err != nil {
-		return err
-	}
-
-	if err := declareQueue(chn, rc.RetryQueue); err != nil {
-		return err
-	}
-
-	if err := bindQueue(chn, rc.RetryQueue, rc.RetryExchange); err != nil {
-		return err
-	}
-
-	if err := declareExchange(chn, rc.ErrorExchange); err != nil {
-		return err
-	}
-
-	if err := declareQueue(chn, rc.ErrorQueue); err != nil {
-		return err
-	}
-
-	if err := bindQueue(chn, rc.ErrorQueue, rc.ErrorExchange); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func prepareRetryParams(rf *RetryConfig, cc ConsumerConfig) {
-	defaultQueueName := cc.Queue.Name
-	exchange := cc.Exchange
-	dle := defaultQueueName
-	if exchange != nil {
-		dle = exchange.Name
-	}
-
-	if rf.RetryQueue == nil {
-		timeout := rf.RetryTimeout
-		if timeout == 0 {
-			timeout = 60 * 1000 // Default 60 seconds
-		}
-		rf.RetryQueue = &Queue{
-			Name:       fmt.Sprintf("%s-retry", defaultQueueName),
-			Durable:    true,
-			RoutingKey: "#",
-			Args: map[string]interface{}{
-				"x-dead-letter-exchange":    dle,
-				"x-message-ttl":             timeout,
-				"x-dead-letter-routing-key": defaultQueueName,
-			},
-		}
-	}
-
-	if rf.ErrorQueue == nil {
-		rf.ErrorQueue = &Queue{
-			Name:       fmt.Sprintf("%s-error", defaultQueueName),
-			Durable:    true,
-			RoutingKey: "#",
-		}
-	}
-
-	if rf.RetryExchange == nil {
-		rf.RetryExchange = &Exchange{
-			Name:    rf.RetryQueue.Name,
-			Type:    amqp.ExchangeTopic,
-			Declare: true,
-		}
-	}
-
-	if rf.ErrorExchange == nil {
-		rf.ErrorExchange = &Exchange{
-			Name:    rf.ErrorQueue.Name,
-			Type:    amqp.ExchangeTopic,
-			Declare: true,
-		}
-	}
-
-	if rf.RetryCount == 0 {
-		rf.RetryCount = 5
-	}
-}
-
+// Reject will realize the necessaries treatments on reject message. If Retryable enabled will manager
+// the number of times that the message try to be processed entering in resilience flux.
+// When RetryCount is reached, the message will sent to -error queue and removed from processing queue
 func (c *Consumer) Reject(channel *amqp.Channel, msg *amqp.Delivery, requeue bool) error {
 	if !c.Config.Retryable {
 		return msg.Reject(requeue)
 	}
 
 	count, _ := getRetryCount(msg, c.Config.Queue.Name)
-	if count >= c.Config.RetryConfig.RetryCount {
+	if count >= c.Config.RetryConfig.RetryCount-1 {
 		if err := channel.Publish(
 			c.Config.RetryConfig.ErrorExchange.Name,
 			"",
@@ -216,6 +93,45 @@ func (c *Consumer) Reject(channel *amqp.Channel, msg *amqp.Delivery, requeue boo
 	}
 }
 
+// closedConnectionListener attempts to reconnect to the server and
+// reopens the channel for set amount of time if the connection is
+// closed unexpectedly. The attempts are spaced at equal intervals.
+func (c *Consumer) closedConnectionListener(closed <-chan *amqp.Error, worker Worker) {
+	log.Println("INFO: Watching closed connection")
+
+	// If you do not want to reconnect in the case of manual disconnection
+	// via RabbitMQ UI or Server restart, handle `amqp.ConnectionForced`
+	// error code.
+	err := <-closed
+	if err != nil {
+		log.Println("INFO: Closed connection:", err.Error())
+
+		var i int
+
+		for i = 0; i < c.Config.Reconnect.MaxAttempt; i++ {
+			log.Println("INFO: Attempting to reconnect")
+
+			if err := c.Rabbit.Connect(); err == nil {
+				log.Println("INFO: Reconnected")
+
+				if err := c.Start(worker); err == nil {
+					break
+				}
+			}
+			time.Sleep(c.Config.Reconnect.Interval)
+		}
+
+		if i == c.Config.Reconnect.MaxAttempt {
+			log.Println("CRITICAL: Giving up reconnecting")
+			return
+		}
+	} else {
+		log.Println("INFO: Connection closed normally, will not reconnect")
+		os.Exit(0)
+	}
+}
+
+// getRetryCount get the number of times a message was on processing queue
 func getRetryCount(msg *amqp.Delivery, queueName string) (int64, error) {
 	if v, ok := msg.Headers["x-death"]; ok {
 		if v2, ok := v.([]interface{}); ok {

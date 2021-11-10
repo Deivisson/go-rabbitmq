@@ -29,6 +29,8 @@ func NewRabbit(config RabbitConfig) *Rabbit {
 	}
 }
 
+// Connect establish a connection with a rabbitmq server and set a amqp.Connection instance
+// to Rabbit.connection
 func (r *Rabbit) Connect() error {
 	if r.connection == nil || r.connection.IsClosed() {
 		con, err := amqp.DialConfig(fmt.Sprintf(
