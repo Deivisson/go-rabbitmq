@@ -33,7 +33,7 @@ type RetryConfig struct {
 	RetryQueue    *Queue
 	RetryExchange *Exchange
 	RetryTimeout  int64
-	RetryCount    int
+	RetryCount    int64
 	ErrorQueue    *Queue
 	ErrorExchange *Exchange
 }
